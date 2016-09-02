@@ -1,7 +1,8 @@
 import mysql.connector
 from gensim import corpora
 from nltk.tokenize import RegexpTokenizer
-from nltk.corpus import stopwords
+from nltk.corpus import stopwords, wordnet
+from nltk.tag.perceptron import PerceptronTagger
 from nltk.stem.wordnet import WordNetLemmatizer
 from timeit import default_timer as timer
 from dateutil.relativedelta import relativedelta
@@ -30,6 +31,7 @@ def getStamps(start, end, granularity) :
     return vecDate
 
 
+	
 ## Helper function ##
 ## Takes start and end timestamps, file connection and database config as inputs 
 ## and returns appropriate documents
@@ -45,12 +47,11 @@ def intervalPosts(start, end, dat_outfile, table, config) :
 	
 	cursor.execute(query)
 	
-	total_posts = 0
 	tokenizer 	= RegexpTokenizer('[a-z][a-z-]+[a-z]')
 	lemmatizer 	= WordNetLemmatizer()
 	stoplist 	= set(stopwords.words('english'))
-	stoplist 	|= {'http', 'https', 'com', 'www'}
-	
+	stoplist 	|= {'http', 'https', 'com', 'www', 'org'}
+	tagger = PerceptronTagger()
 	
 	print("Results between " + start + " and " + end + " starting")
 	
@@ -58,30 +59,38 @@ def intervalPosts(start, end, dat_outfile, table, config) :
 	
 	for line in cursor:
 	
-		content = line[4]
+		
+		if line[4] == None :
+			content = line[5]
+		else :
+			content = ' '.join([line[4], line[5]])
+		
+	
+		##content = line[4]
 		
 		if content == None :
 			continue
-		if line[6] == None :
+		if line[7] == None :
 			quotes = str(None)
 		else :
-			quotes = line[6].encode('utf-8')
-		if line[5] == None :
+			quotes = line[7].encode('utf-8')
+		if line[6] == None :
 			links = str(None)
 		else :
-			links = line[5].encode('utf-8')
+			links = line[6].encode('utf-8')
 		
 		## start preprocessing here
 		
 		content = tokenizer.tokenize(content.lower())
-		content = [lemmatizer.lemmatize(token) for token in content]
 		
-		if not any(x in stoplist for x in content) :
-			continue
+		tagged = tagger.tag(content)
+		
+		tagged = [word for word, tag in tagged if tag[0] == 'N' or tag[0] == 'F'] ## or word in specVocab]
+		content = [lemmatizer.lemmatize(word) for word in tagged]
 		
 		content = ' '.join([word for word in content if word not in stoplist])
 		
-		if len(content) < 50:
+		if len(content) < 20:
 			continue
 		
 		try :
@@ -118,7 +127,7 @@ def intervalPosts(start, end, dat_outfile, table, config) :
 
 ## Takes a list of time stamps, a file path, a MySQL table name and
 ## a database config as input and creates the metadat file, metadata.dat
-def createMeta(timeStamps, filePath, table, config) :
+def createMeta(filePath, timeStamps, table, config) :
 
 	with open(os.path.join(filePath, 'metadata.dat'),'w') as dat_outfile :
 
@@ -139,9 +148,12 @@ def createMeta(timeStamps, filePath, table, config) :
 ## Takes a file path, a relativedelta time granularity, a start and 
 ## end date in the following format: 2009-11-21 00:00:00 and creates
 ## the time slice file, -seq.dat
-def createSeq(filePath, start, end, granularity) :
+def createSeq(filePath, timeStamps) :
 
 	print("Seq creation start")
+	
+	first = datetime.datetime.strptime(timeStamps[0], '%Y-%m-%d %H:%M:%S')
+	last   = datetime.datetime.strptime(timeStamps[len(timeStamps) - 1], '%Y-%m-%d %H:%M:%S')
 	
 	with open(os.path.join(filePath, 'metadata.dat'), 'r') as open_file :
 		count 		= 0
@@ -150,19 +162,37 @@ def createSeq(filePath, start, end, granularity) :
 		countList 	= []
 
 		reader.next()
+		
+		a = 0
+		currentDown = datetime.datetime.strptime(timeStamps[a], '%Y-%m-%d %H:%M:%S')
+		currentUp = datetime.datetime.strptime(timeStamps[a + 1], '%Y-%m-%d %H:%M:%S')
 
 		for line in reader :
-			time = datetime.datetime.strptime(line[2], '%Y-%m-%d %H:%M:%S')
-			if time > end :
-				break
-			if time < (start + granularity) :
+			
+			if len(line[2]) < 19 :
+				time = datetime.datetime.strptime(line[2], '%Y-%m-%d')
+			else :
+				time = datetime.datetime.strptime(line[2], '%Y-%m-%d %H:%M:%S')
+			
+			if time < first :
+				raise ValueError('Metadata starts before the specified date')
+			elif time > last :
+				raise ValueError('Metadata goes beyond the specified date')
+			
+			
+			if currentDown <= time < currentUp :
 				count += 1
 			else :
-				start += granularity
 				countList.append(count)
-				print time.strftime('%Y-%m-%d %H:%M:%S')
-				print count
 				count = 1
+				a += 1
+				currentDown = datetime.datetime.strptime(timeStamps[a], '%Y-%m-%d %H:%M:%S')
+				currentUp = datetime.datetime.strptime(timeStamps[a + 1], '%Y-%m-%d %H:%M:%S')
+				while time >= currentUp :
+					a += 1
+					currentDown = datetime.datetime.strptime(timeStamps[a], '%Y-%m-%d %H:%M:%S')
+					currentUp = datetime.datetime.strptime(timeStamps[a + 1], '%Y-%m-%d %H:%M:%S')
+					countList.append(0)
 				
 	
 	if count != 1 :
@@ -180,6 +210,7 @@ def createSeq(filePath, start, end, granularity) :
 ## Takes a file path as input and creates a dictionary and vocabulary
 ## file from the metadata file
 def createDictionary(filePath) :
+	print 'Dictionary and Vocabulary start'
 	with open(os.path.join(filePath, 'metadata.dat'), 'r') as corpus_file :
 		reader		= csv.reader(corpus_file, delimiter = '\t')
 		reader.next()
@@ -191,8 +222,9 @@ def createDictionary(filePath) :
 	## save vocabulary
 	with open(os.path.join(filePath, 'vocabulary.dat'), 'w') as voc_file :
 		for word in dictionary.values():
-			vocFile.write(word+'\n')
+			voc_file.write(word + '\n')
 
+	print 'Dictionary and Vocabulary saved'
 	return True
 	
 	
@@ -200,7 +232,8 @@ def createDictionary(filePath) :
 ## file i.e. the sparse term document matrix, -mult.dat
 def createMult(filePath, dictionaryFileName) :	
 	dictionary 	= corpora.Dictionary().load(os.path.join(filePath, dictionaryFileName))
-
+	docLengths = []
+	
 	with open(os.path.join(filePath, 'metadata.dat'), 'r') as corpus_file :
 		reader 		= csv.reader(corpus_file, delimiter = '\t')
 		reader.next()
@@ -216,11 +249,12 @@ def createMult(filePath, dictionaryFileName) :
 		## only loads a line at a time			
 		corpus_memory_friendly = MyCorpus()
 
-		with open(os.path.join(filePath, '-mult.dat'),'w') as multfile :
+		with open(os.path.join(filePath, '-mult.dat'),'w') as multFile :
 			count = 1
 
 			for vector in corpus_memory_friendly : 
 				multFile.write(str(len(vector)) + ' ')
+				docLengths.append(len(vector))
 				for (wordID, weight) in vector : 
 					multFile.write(str(wordID) + ':' + str(weight) + ' ')
 				multFile.write('\n')
@@ -228,8 +262,11 @@ def createMult(filePath, dictionaryFileName) :
 					print(str(count) + ' documents written')
 				count += 1
 
+	with open(os.path.join(filePath, 'docLengths.dat'), 'w') as lengths_file :
+		for length in docLengths :
+			lengths_file.write(str(length) + '\n')
+	
 	print('Multfile saved')
 	return True
 	
-
 	
